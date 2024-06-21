@@ -1,0 +1,122 @@
+name: Build Synergy-Core on macOS
+
+on:
+  push:
+    branches:
+      - master
+
+defaults:
+  run:
+    shell: "/usr/bin/arch -arch arm64e /bin/bash --noprofile --norc -eo pipefail {0}"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 10
+
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+
+    env:
+      GIT_COMMIT: ${{ github.sha }}
+      Qt5_DIR: "$(brew --prefix qt5)"
+      OpenSSL_DIR: "$(brew --prefix openssl)"
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      with:
+        submodules: "recursive"
+
+    - name: Setup PATH
+      run: echo "/opt/homebrew/bin" >> $GITHUB_PATH
+
+    - name: Setup Environment
+      run: |
+        python3 -m pip install dmgbuild
+        brew bundle --file=- <<< "brew 'qt5'; brew 'openssl'"
+
+    - name: Build Synergy-Core (ARM64)
+      if: matrix.arch == 'arm64'
+      env:
+        CMAKE_PREFIX_PATH: "${{ env.Qt5_DIR }};${{ env.OpenSSL_DIR }}"
+      run: |
+        export PATH="${{ env.Qt5_DIR }}/bin:$PATH"
+        python3 scripts/build_version.py
+        mkdir build
+        cd build
+        arch -arm64 cmake \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=11 \
+          -DCMAKE_OSX_ARCHITECTURES=arm64 \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_CONFIGURATION_TYPES=Release ..
+        . ./version
+        make -j
+        make install/strip
+
+    - name: Build Synergy-Core (x64)
+      if: matrix.arch == 'x64'
+      env:
+        CMAKE_PREFIX_PATH: "${{ env.Qt5_DIR }};${{ env.OpenSSL_DIR }}"
+      run: |
+        export PATH="${{ env.Qt5_DIR }}/bin:$PATH"
+        python3 scripts/build_version.py
+        mkdir build
+        cd build
+        cmake \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+          -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_CONFIGURATION_TYPES=Release ..
+        . ./version
+        make -j
+        make install/strip
+
+    - name: Archive binaries
+      run: |
+        mkdir -p binaries
+        if [ "${{ matrix.arch }}" == "arm64" ]; then
+          mv build/* binaries/synergy-core-macos-arm64
+        else
+          mv build/* binaries/synergy-core-macos
+        fi
+
+    - name: Version Info
+      id: version
+      run: |
+        . ./build/version
+        SYNERGY_VERSION="${SYNERGY_VERSION_MAJOR}.${SYNERGY_VERSION_MINOR}.${SYNERGY_VERSION_PATCH}"
+        SYNERGY_REVISION=$(git rev-parse --short=8 HEAD)
+        SYNERGY_DMG_VERSION="${SYNERGY_VERSION}-${SYNERGY_VERSION_STAGE}.${SYNERGY_REVISION}"
+        echo "::set-output name=SYNERGY_VERSION_MAJOR::$SYNERGY_VERSION_MAJOR"
+        echo "::set-output name=SYNERGY_VERSION_MINOR::$SYNERGY_VERSION_MINOR"
+        echo "::set-output name=SYNERGY_VERSION_PATCH::$SYNERGY_VERSION_PATCH"
+        echo "::set-output name=SYNERGY_VERSION_STAGE::$SYNERGY_VERSION_STAGE"
+        echo "::set-output name=SYNERGY_VERSION_BUILD::$SYNERGY_VERSION_BUILD"
+        echo "::set-output name=SYNERGY_VERSION::$SYNERGY_VERSION"
+        echo "::set-output name=SYNERGY_REVISION::$SYNERGY_REVISION"
+        echo "::set-output name=SYNERGY_DMG_VERSION::$SYNERGY_DMG_VERSION"
+
+    - name: Create Installer
+      env:
+        SYNERGY_DMG_FILENAME: ${{ steps.version.outputs.SYNERGY_DMG_FILENAME }}
+      run: |
+        dmgbuild \
+          -s CI/MacOS/installator_settings.py \
+          -D app=${{ github.workspace }}/build/bundle/Synergy.app \
+          -D background=${{ github.workspace }}/build/bundle/Synergy.app/Contents/Resources/.installer_background.tiff \
+          "Synergy" \
+          $SYNERGY_DMG_FILENAME
+        mkdir pkg
+        mv $SYNERGY_DMG_FILENAME pkg/
+        cd pkg
+        md5 -r $SYNERGY_DMG_FILENAME >> $SYNERGY_DMG_FILENAME.checksum.txt
+        shasum $SYNERGY_DMG_FILENAME >> $SYNERGY_DMG_FILENAME.checksum.txt
+        shasum -a 256 $SYNERGY_DMG_FILENAME >> $SYNERGY_DMG_FILENAME.checksum.txt
+
+    - name: Upload Installer as Artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: macos-installer-${{ matrix.arch }}
+        path: pkg/
